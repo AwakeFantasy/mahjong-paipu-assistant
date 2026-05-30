@@ -1,8 +1,10 @@
 import { fetchMjsoulGame } from "./client";
 import { createDebugCollector, type DebugCollector } from "./debug";
 import { normalizeMjsoulGame } from "./normalize";
+import { fetchRiichiCityGame } from "./riichi-city";
+import { fetchTenhouGame } from "./tenhou";
 import { parsePaipuSource } from "./url";
-import { AnalyzeError, type AnalyzeSuccess, type RawMjsoulGame } from "./types";
+import { AnalyzeError, type AnalyzeSuccess, type MahjongSoulRegion, type PaipuSource, type RawMjsoulGame } from "./types";
 
 export type AnalyzeRequest = {
   url?: string;
@@ -27,7 +29,7 @@ export async function analyzePaipu(
       : parsePaipuSource(request.url ?? "", request.targetSeat);
     debug?.setSource(source);
 
-    const fetchGame = dependencies.fetchGame ?? fetchMjsoulGame;
+    const fetchGame = dependencies.fetchGame ?? fetchGameBySource;
     const rawGame = await fetchGame(source, debug);
     debug?.setRawGame(rawGame);
     const result = debug
@@ -47,4 +49,16 @@ export async function analyzePaipu(
 
     throw error;
   }
+}
+
+function fetchGameBySource(source: PaipuSource, debug?: DebugCollector) {
+  if (source.provider === "tenhou" || source.region === "tenhou") {
+    return fetchTenhouGame(source, debug);
+  }
+
+  if (source.provider === "riichi-city" || source.region === "riichi-city") {
+    return fetchRiichiCityGame(source, debug);
+  }
+
+  return fetchMjsoulGame(source as PaipuSource & { region: MahjongSoulRegion }, debug);
 }

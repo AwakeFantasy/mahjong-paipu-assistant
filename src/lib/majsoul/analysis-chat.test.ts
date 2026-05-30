@@ -36,7 +36,7 @@ const round: Round = {
   events: [
     { type: "draw", seat: 0, tile: "6p" },
     { type: "discard", seat: 0, tile: "5p", moqie: false, riichi: false },
-    { type: "discard", seat: 1, tile: "9m", moqie: true, riichi: false },
+    { type: "discard", seat: 1, tile: "8s", moqie: true, riichi: false },
   ],
 };
 
@@ -80,7 +80,8 @@ describe("analysis chat snapshot", () => {
     );
 
     expect(response.snapshotKey).toContain("east-1:2/3:seat0");
-    expect(response.answer).toContain("当前可见信息");
+    expect(response.answer).toContain("可见");
+    expect(response.structured?.reasons.join(" ")).toContain("牌效");
     expect(response.engine.status).toBe("unavailable");
     expect(response.llm.status).toBe("unavailable");
     expect(response.warnings.join(" ")).toContain("不读取未来事件");
@@ -106,9 +107,10 @@ describe("analysis chat snapshot", () => {
     );
 
     expect(response.llm.status).toBe("unavailable");
-    expect(response.answer).toContain("暂时没有拿到模型回答");
-    expect(response.answer).toContain("400");
-    expect(response.answer).toContain("model not found");
+    expect(response.answer).not.toContain("风险");
+    expect(response.warnings.join(" ")).toContain("400");
+    expect(response.warnings.join(" ")).toContain("model not found");
+    expect(response.structured?.risks.join(" ")).toContain("400");
   });
 
   it("sanitizes context and slices visible events to the current cursor", () => {
@@ -130,6 +132,194 @@ describe("analysis chat snapshot", () => {
     expect(serialized).not.toContain("accountId");
     expect(serialized).not.toContain("10001");
     expect(serialized).not.toContain('"name":"A"');
-    expect(serialized).not.toContain("9m");
+    expect(serialized).not.toContain("8s");
+  });
+
+  it("builds an analysis package without future events or private identifiers", async () => {
+    const snapshot = buildVisibleAnalysisSnapshot({
+      source: { id: "sample", region: "cn" },
+      players,
+      round,
+      targetSeat: 0,
+      cursor: 2,
+    });
+    let llmBody = "";
+    const response = await answerAnalysisChat(
+      { question: "这一步怎么打？", snapshot, visibleEvents: round.events },
+      {
+        engine: {
+          env: { MORTAL_ENGINE_URL: "http://engine.local/analyze" },
+          fetch: async () => new Response(JSON.stringify({ recommendations: [{ action: "discard", tile: "1m", rank: 1, tags: ["mock"] }] }), { status: 200 }),
+        },
+        llm: {
+          env: { ANALYSIS_LLM_BASE_URL: "http://llm.local/v1", ANALYSIS_LLM_API_KEY: "secret", ANALYSIS_LLM_MODEL: "mock-model" },
+          fetch: async (_url, init) => {
+            llmBody = String(init?.body);
+            return new Response(
+              JSON.stringify({
+                choices: [
+                  {
+                    message: {
+                      content: JSON.stringify({
+                        engineAdvice: "use engine top discard",
+                        llmExplanation: "recommendation first candidate available",
+                        visibleLimitations: "visible information only",
+                        warnings: [],
+                      }),
+                    },
+                  },
+                ],
+              }),
+              { status: 200 },
+            );
+          },
+        },
+      },
+    );
+
+    expect(response.structured?.reasons.join(" ")).toContain("recommendation first candidate available");
+    expect(JSON.stringify(response.structured)).not.toContain("Mortal");
+    expect(llmBody).toContain("visibleEvents");
+    expect(llmBody).toContain("engine");
+    expect(llmBody).not.toContain("accountId");
+    expect(llmBody).not.toContain("10001");
+    expect(llmBody).not.toContain("8s");
+  });
+
+  it("adds an explanation boundary instead of inventing a possible reason", async () => {
+    const snapshot = {
+      source: { id: "sample", region: "cn" as const },
+      round: { id: "east-1", title: "东1局", windRound: 0, roundNumber: 0, honba: 0, riichiSticks: 0, dealer: "东家", danger: "low" as const },
+      cursor: 105,
+      maxCursor: 109,
+      targetSeat: 0 as const,
+      players: [{ seat: 0 as const, wind: "E" as const, name: "A", score: "25,000", startScore: 25000, style: "目标" }],
+      doraIndicators: ["1m"],
+      targetHand: ["2m", "3m", "3m", "4m", "5m", "6s", "7s", "8s", "2p", "3p", "4p"],
+      discards: { 0: [], 1: ["9p", "4s", "6s"], 2: ["7s"], 3: [] },
+      calls: { 0: [], 1: [], 2: [], 3: [] },
+      riichiTiles: { 0: [], 1: [1], 2: [], 3: [] },
+      currentEventText: "东1局 0本场",
+    };
+    const visibleEvents: Round["events"] = [
+      { type: "discard", seat: 2, tile: "7s", moqie: false, riichi: false },
+      { type: "discard", seat: 1, tile: "4s", moqie: false, riichi: true },
+      { type: "discard", seat: 1, tile: "6s", moqie: false, riichi: false },
+    ];
+    const llmFetch = async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      const systemPrompt = String(body.messages[0].content);
+
+      if (systemPrompt.includes("规划器")) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: JSON.stringify({ answer: "规划", answerMode: "explain", summary: "解释 6索 vs 7索", focusPoints: [], requiredFacts: [], avoidClaims: [], priorityOrder: [], tone: "简洁", warnings: [] }) } }],
+          }),
+          { status: 200 },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  answer: "更推荐切6索。",
+                  conclusion: "更推荐切6索，保留7索。",
+                  reasons: ["当前推荐排序更偏向切6索。"],
+                  risks: ["只看当前可见信息。"],
+                  suggestedQuestions: [],
+                  evidence: [],
+                  evidenceIds: [],
+                  directReplies: [],
+                  correctionsAccepted: [],
+                  warnings: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+
+    const response = await answerAnalysisChat(
+      { question: "为什么mortal觉得切6s比7s好？", snapshot, visibleEvents },
+      {
+        engine: {
+          env: { MORTAL_ENGINE_URL: "http://engine.local/analyze" },
+          fetch: async () =>
+            new Response(
+              JSON.stringify({
+                recommendations: [
+                  { action: "discard", tile: "6s", rank: 1, probability: 0.48, tags: [] },
+                  { action: "discard", tile: "7s", rank: 3, probability: 0.16, tags: [] },
+                ],
+              }),
+              { status: 200 },
+            ),
+        },
+        llm: {
+          env: { ANALYSIS_LLM_BASE_URL: "http://llm.local/v1", ANALYSIS_LLM_API_KEY: "secret", ANALYSIS_LLM_MODEL: "mock-model" },
+          fetch: llmFetch,
+        },
+      },
+    );
+
+    expect(response.answer).toContain("解释边界");
+    expect(response.answer).not.toContain("可能次因");
+    expect(response.answer).not.toContain("全桌已见 7索");
+    expect(response.structured?.conclusion).toContain("解释边界");
+  });
+
+  it("surfaces llm timeout at the front of the fallback answer", async () => {
+    const snapshot = buildVisibleAnalysisSnapshot({
+      source: { id: "sample", region: "cn" },
+      players,
+      round,
+      targetSeat: 0,
+      cursor: 2,
+    });
+    const response = await answerAnalysisChat(
+      { question: "杩欎竴姝ユ€庝箞鎵擄紵", snapshot },
+      {
+        engine: { env: { ANALYSIS_ENABLE_ENGINE: "false" } },
+        llm: {
+          env: { ANALYSIS_LLM_API_KEY: "secret", ANALYSIS_LLM_MODEL: "mock-model" },
+          fetch: async () => {
+            throw new DOMException("The operation was aborted.", "AbortError");
+          },
+        },
+      },
+    );
+
+    expect(response.llm.status).toBe("unavailable");
+    expect(response.answer.startsWith("LLM 请求超时")).toBe(true);
+    expect(response.structured?.conclusion.startsWith("LLM 请求超时")).toBe(true);
+  });
+
+  it("surfaces gateway timeout responses at the front of the fallback answer", async () => {
+    const snapshot = buildVisibleAnalysisSnapshot({
+      source: { id: "sample", region: "cn" },
+      players,
+      round,
+      targetSeat: 0,
+      cursor: 2,
+    });
+    const response = await answerAnalysisChat(
+      { question: "为什么这里推荐切8筒而不是4筒呢？", snapshot },
+      {
+        engine: { env: { ANALYSIS_ENABLE_ENGINE: "false" } },
+        llm: {
+          env: { ANALYSIS_LLM_API_KEY: "secret", ANALYSIS_LLM_MODEL: "mock-model" },
+          fetch: async () => new Response("gateway timeout", { status: 504 }),
+        },
+      },
+    );
+
+    expect(response.llm.failureReason).toBe("timeout");
+    expect(response.answer.startsWith("LLM 请求超时")).toBe(true);
+    expect(response.structured?.conclusion.startsWith("LLM 请求超时")).toBe(true);
   });
 });

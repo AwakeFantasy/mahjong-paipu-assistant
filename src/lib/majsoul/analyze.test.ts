@@ -43,6 +43,35 @@ describe("analyzePaipu", () => {
     expect(result.selectedRound?.result).toBe("流局 1 人听牌");
   });
 
+  it("keeps tenhou sources on the shared analysis path", async () => {
+    const result = await analyzePaipu(
+      { url: "https://tenhou.net/0/?log=2016031919gm-0009-0000-490705b1", targetSeat: 0 },
+      { fetchGame: async () => game },
+    );
+
+    expect(result.source).toMatchObject({
+      id: "2016031919gm-0009-0000-490705b1",
+      region: "tenhou",
+      provider: "tenhou",
+    });
+    expect(result.rounds).toHaveLength(1);
+  });
+
+  it("keeps riichi city sources on the shared analysis path", async () => {
+    const result = await analyzePaipu(
+      { url: "ch35u1e9nc70954ah9n0@2" },
+      { fetchGame: async () => game },
+    );
+
+    expect(result.source).toMatchObject({
+      id: "ch35u1e9nc70954ah9n0",
+      region: "riichi-city",
+      provider: "riichi-city",
+      targetSeat: 2,
+    });
+    expect(result.rounds).toHaveLength(1);
+  });
+
   it("returns sanitized debug data when requested", async () => {
     const result = await analyzePaipu(
       {

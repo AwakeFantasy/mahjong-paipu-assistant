@@ -15,11 +15,15 @@ ANALYSIS_LLM_BASE_URL=https://api.openai.com/v1
 ANALYSIS_LLM_API_KEY=
 ANALYSIS_LLM_MODEL=
 ANALYSIS_LLM_TIMEOUT_MS=60000
+ANALYSIS_LLM_MAX_TOKENS=900
 ANALYSIS_LLM_FLASH_MODEL=
 ANALYSIS_LLM_FLASH_TIMEOUT_MS=60000
+ANALYSIS_LLM_FLASH_MAX_TOKENS=900
 ANALYSIS_LLM_PRO_MODEL=
-ANALYSIS_LLM_PRO_TIMEOUT_MS=120000
+ANALYSIS_LLM_PRO_TIMEOUT_MS=180000
+ANALYSIS_LLM_PRO_MAX_TOKENS=1200
 ANALYSIS_LLM_RESPONSE_FORMAT=json_schema
+ANALYSIS_LLM_THINKING=disabled
 ```
 
 The provider must support a Chat Completions-compatible `POST /chat/completions` endpoint.
@@ -33,6 +37,20 @@ The UI exposes:
 
 If a choice-specific model is empty, the adapter falls back according to `analysis-llm.ts`.
 
+For DeepSeek V4-compatible endpoints, the adapter defaults to `response_format=json_object`, `max_tokens`, and `thinking={type:"disabled"}` for current-hand chat. This keeps short tactical explanations from entering the provider's slower default thinking mode. Set `ANALYSIS_LLM_THINKING=enabled` only when you intentionally want that latency/cost tradeoff.
+
+## Current-Hand Pipeline
+
+Current-hand chat uses a controlled three-pass LLM pipeline behind the existing public API shape:
+
+1. `planner`: reads the question and structured analysis package, then chooses the answer mode, priority factors, required facts, and claims to avoid.
+2. `writer`: writes the visible Chinese answer from the plan and deterministic facts.
+3. `verifier`: checks the draft for factual drift, internal field leakage, weak-factor overstatement, and missed user corrections; it returns the final structured answer or a corrected version.
+
+The deterministic layer remains the source of truth. Tile efficiency, safety hints, dora facts, candidate comparisons, knowledge cases, and final local validation are still produced by TypeScript modules before/after LLM wording. The LLM may explain those facts, but should not replace them.
+
+Planner and verifier use lower token budgets and shorter timeouts than the writer pass. The external `AnalysisChatResponse` shape is unchanged; pass-level plan/draft/review data is not sent to the frontend.
+
 ## Output Handling
 
 Preferred output is structured JSON:
@@ -40,14 +58,18 @@ Preferred output is structured JSON:
 ```json
 {
   "answer": "...",
-  "keyPoints": [],
-  "caveats": [],
+  "conclusion": "...",
+  "reasons": [],
+  "risks": [],
   "suggestedQuestions": [],
+  "evidence": [],
+  "directReplies": [],
+  "correctionsAccepted": [],
   "warnings": []
 }
 ```
 
-If the model returns plain text, the app still displays it and adds a warning. If the LLM is unavailable, the app returns a deterministic fallback answer.
+If a pass returns plain text, malformed JSON, times out, or fails, the app still returns a readable controlled answer. If the verifier cannot produce a valid structured answer, the writer draft is locally sanitized and the chat layer can still fall back to deterministic output through `validateAnalysisAnswer()`.
 
 ## Privacy
 

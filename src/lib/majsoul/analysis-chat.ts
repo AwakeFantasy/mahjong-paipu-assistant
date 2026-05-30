@@ -1,13 +1,21 @@
 import { buildPlaybackState, type PlaybackSeat, type PlaybackState } from "./playback";
 import { analyzeCurrentHandWithEngine, type AnalysisEngineDependencies } from "./analysis-engine";
+import { runCurrentHandAnalysisGraph, validateAnalysisAnswer } from "./analysis-graph";
 import { generateLlmAnalysis, type AnalysisLlmDependencies } from "./analysis-llm";
+import { buildDecisionContext, formatDecisionContextSummary } from "./decision-context";
+import { analyzeOffensiveEv, type OffensiveEvScoreFn } from "./offensive-ev";
+import { analyzeRouteFactors } from "./route-factors";
+import { buildTileSafetyHintFromSnapshot } from "./safety-hints";
+import { analyzeTileEfficiency } from "./tile-efficiency";
 import { formatTileName, formatTileNames } from "./tile-format";
 import type {
   AnalysisContext,
   AnalysisChatRequest,
   AnalysisChatResponse,
+  AnalysisChatStructured,
   AnalysisEngineResult,
   AnalysisLlmResult,
+  CurrentHandAnalysisPackage,
   Player,
   Round,
   RoundEvent,
@@ -18,6 +26,7 @@ import type {
 export type AnalysisChatDependencies = {
   engine?: AnalysisEngineDependencies;
   llm?: AnalysisLlmDependencies;
+  scoreWinningHand?: OffensiveEvScoreFn;
 };
 
 export function buildVisibleAnalysisSnapshot({
@@ -107,8 +116,26 @@ export async function answerAnalysisChat(request: AnalysisChatRequest, dependenc
   }
 
   const engine = await analyzeCurrentHandWithEngine(context, dependencies.engine);
-  const llmAnswer = await generateLlmAnalysis(context, engine, { ...dependencies.llm, modelChoice: request.llmModel });
-  const answer = llmAnswer.answer ?? buildHybridFallbackAnswer(question, snapshot, engine, llmAnswer.llm);
+  const graphState = await runCurrentHandAnalysisGraph(context, engine, { scoreWinningHand: dependencies.scoreWinningHand });
+  const enrichedContext: AnalysisContext = {
+    ...context,
+    analysisPackage: graphState.analysisPackage,
+  };
+  const llmAnswer = await generateLlmAnalysis(enrichedContext, engine, { ...dependencies.llm, modelChoice: request.llmModel });
+  const validation = llmAnswer.structured ? validateAnalysisAnswer(llmAnswer.structured, graphState) : null;
+  const structuredBase = validation?.structured ?? graphState.directAnswer ?? buildHybridFallbackStructured(question, snapshot, llmAnswer.llm, enrichedContext.analysisPackage);
+  const structuredWithWarnings =
+    !llmAnswer.structured && llmAnswer.llm.warnings.length
+      ? {
+          ...structuredBase,
+          risks: [...structuredBase.risks, ...llmAnswer.llm.warnings].slice(0, 5),
+        }
+      : structuredBase;
+  const structuredWithBoundary = appendExplanationBoundary(structuredWithWarnings, enrichedContext.analysisPackage?.tableInference);
+  const llmNotice = buildLlmFrontNotice(llmAnswer.llm);
+  const structured = llmNotice ? prependStructuredNotice(structuredWithBoundary, llmNotice) : structuredWithBoundary;
+  const baseAnswer = enrichedContext.analysisPackage?.tableInference?.applies || validation?.warnings.length ? formatStructuredChatAnswer(structured) : (llmAnswer.answer ?? formatStructuredChatAnswer(structured));
+  const answer = llmNotice && !baseAnswer.startsWith(llmNotice) ? `${llmNotice}\n${baseAnswer}` : baseAnswer;
 
   return {
     answer,
@@ -116,7 +143,41 @@ export async function answerAnalysisChat(request: AnalysisChatRequest, dependenc
     engine,
     llm: llmAnswer.llm,
     visibleSummary,
-    warnings: [...warnings, ...engine.warnings, ...llmAnswer.llm.warnings],
+    structured,
+    warnings: [...warnings, ...engine.warnings, ...llmAnswer.llm.warnings, ...(validation?.warnings ?? [])],
+  };
+}
+
+function appendExplanationBoundary(
+  structured: AnalysisChatStructured,
+  tableInference: CurrentHandAnalysisPackage["tableInference"] | undefined,
+): AnalysisChatStructured {
+  if (!tableInference?.applies || structured.conclusion.includes(tableInference.reason)) {
+    return structured;
+  }
+
+  return {
+    ...structured,
+    conclusion: `${structured.conclusion}\n${tableInference.reason}`,
+  };
+}
+
+function buildLlmFrontNotice(llm: AnalysisLlmResult) {
+  if (llm.failureReason === "timeout") {
+    return "LLM 请求超时，以下是本地降级分析。";
+  }
+
+  return "";
+}
+
+function prependStructuredNotice(structured: AnalysisChatStructured, notice: string): AnalysisChatStructured {
+  if (!notice || structured.conclusion.startsWith(notice)) {
+    return structured;
+  }
+
+  return {
+    ...structured,
+    conclusion: `${notice}\n${structured.conclusion}`,
   };
 }
 
@@ -135,6 +196,7 @@ export function buildAnalysisContext({
   visibleSummary?: string[];
 }): AnalysisContext {
   const safeSnapshot = sanitizeSnapshot(snapshot);
+  const decisionContext = buildDecisionContext(safeSnapshot, question);
 
   return {
     mode: "current-hand",
@@ -142,23 +204,194 @@ export function buildAnalysisContext({
     snapshot: safeSnapshot,
     visibleEvents: sanitizeVisibleEvents(visibleEvents, snapshot.cursor),
     visibleSummary: summarizeSnapshot(safeSnapshot),
+    decisionContext,
   };
 }
 
-function buildHybridFallbackAnswer(question: string, snapshot: VisibleAnalysisSnapshot, engine: AnalysisEngineResult, llm: AnalysisLlmResult) {
-  const engineHint =
-    engine.status === "available" && engine.recommendations.length
-      ? `\n\n牌桌上会优先展示 Mortal 第一候选：${formatRecommendationForUser(engine.recommendations[0])}。`
-      : "";
-
-  return `${formatLlmFallbackIntro(llm)}\n\n${buildHeuristicAnswer(question, snapshot)}${engineHint}\n\n注意：回答只基于当前光标之前的可见信息。`;
+export async function buildCurrentHandAnalysisPackage(
+  snapshot: VisibleAnalysisSnapshot,
+  engine: AnalysisEngineResult,
+  decisionContext: AnalysisContext["decisionContext"] = buildDecisionContext(snapshot, ""),
+  dependencies: Pick<AnalysisChatDependencies, "scoreWinningHand"> = {},
+): Promise<CurrentHandAnalysisPackage> {
+  const visibleTiles = [
+    ...Object.values(snapshot.discards).flat(),
+    ...Object.values(snapshot.calls).flatMap((calls) => calls.flatMap((call) => call.tiles)),
+    ...snapshot.doraIndicators,
+  ];
+  const tileEfficiency = analyzeTileEfficiency(snapshot.targetHand, visibleTiles);
+  const targetPlayer = snapshot.players.find((player) => player.seat === snapshot.targetSeat);
+  const offensiveEv = await analyzeOffensiveEv({
+    tiles: snapshot.targetHand,
+    visibleTiles,
+    doraIndicators: snapshot.doraIndicators,
+    openMeldCount: snapshot.calls[snapshot.targetSeat].length,
+    ownDiscards: snapshot.discards[snapshot.targetSeat],
+    ownCalls: snapshot.calls[snapshot.targetSeat],
+    seatWind: targetPlayer?.wind ?? "E",
+    roundWind: roundWindFromIndex(snapshot.round.windRound),
+    scoreWinningHand: dependencies.scoreWinningHand,
+  });
+  const engineTop = [...engine.recommendations].sort((left, right) => left.rank - right.rank).slice(0, 3);
+  const engineTiles = engineTop.map((recommendation) => recommendation.tile).filter((tile): tile is string => Boolean(tile));
+  const packagedEfficiencyOptions = selectEfficiencyOptions(tileEfficiency.discardOptions, engineTiles, 6);
+  const packagedOffensiveEvOptions = selectEfficiencyOptions(offensiveEv.options, engineTiles, 6);
+  const efficiencyTiles = packagedEfficiencyOptions.slice(0, 3).map((option) => option.discard);
+  const routeFactorOptions = analyzeRouteFactors({
+    tiles: snapshot.targetHand,
+    candidateDiscards: [...new Set([...engineTiles, ...efficiencyTiles])],
+    seatWind: targetPlayer?.wind ?? "E",
+    roundWind: roundWindFromIndex(snapshot.round.windRound),
+  });
+  const packagedRouteFactors = selectEfficiencyOptions(routeFactorOptions, engineTiles, 6);
+  const safetyTiles = [...new Set([...engineTiles, ...efficiencyTiles])].slice(0, 6);
+  const candidateHints = safetyTiles
+    .map((tile) => buildTileSafetyHintFromSnapshot({ tile, snapshot }))
+    .filter((hint): hint is NonNullable<ReturnType<typeof buildTileSafetyHintFromSnapshot>> => Boolean(hint));
+  return {
+    readonlyNotice: "只基于当前光标之前的可见信息，不读取未来事件或牌山。",
+    decisionContext,
+    hand: {
+      tiles: [...snapshot.targetHand],
+      drawnTile: snapshot.drawnTile,
+      doraIndicators: [...snapshot.doraIndicators],
+    },
+    engine: {
+      status: engine.status,
+      topRecommendations: engineTop.map((recommendation) => {
+        const safety = recommendation.tile ? candidateHints.find((hint) => hint.tile === recommendation.tile) : undefined;
+        return {
+          rank: recommendation.rank,
+          action: recommendation.action,
+          tile: recommendation.tile,
+          label: formatRecommendationForUser(recommendation),
+          probability: recommendation.probability,
+          tags: [...recommendation.tags],
+          safety: safety
+            ? {
+                tone: safety.tone,
+                labels: [...safety.labels],
+                description: safety.description,
+              }
+            : undefined,
+        };
+      }),
+      warnings: [...engine.warnings],
+    },
+    tileEfficiency: {
+      status: tileEfficiency.status,
+      tileCount: tileEfficiency.tileCount,
+      shanten: tileEfficiency.shanten,
+      standardShanten: tileEfficiency.standardShanten,
+      sevenPairsShanten: tileEfficiency.sevenPairsShanten,
+      thirteenOrphansShanten: tileEfficiency.thirteenOrphansShanten,
+      topDiscards: packagedEfficiencyOptions.map((option) => ({
+        discard: option.discard,
+        label: `切 ${formatTileName(option.discard)}：${formatShanten(option.shantenAfterDiscard)}，剩余受入 ${option.waitCount} 枚`,
+        shantenAfterDiscard: option.shantenAfterDiscard,
+        waitCount: option.waitCount,
+        waits: option.waits.slice(0, 6).map((wait) => `${formatTileName(wait.tile)} ${wait.remaining}/${wait.theoretical}`),
+      })),
+      message: tileEfficiency.message,
+    },
+    offensiveEv: {
+      status: offensiveEv.status,
+      topDiscards: packagedOffensiveEvOptions.map((option) => ({
+        discard: option.discard,
+        label:
+          option.shantenAfterDiscard <= 1
+            ? `切 ${formatTileName(option.discard)}：实验性进攻EV ${option.offensiveEv}，预计打点 ${option.averageScore}，进张 ${option.ukeire} 枚`
+            : `切 ${formatTileName(option.discard)}：远手路线参考 ${option.offensiveEv}，预计打点 ${option.averageScore}，进张 ${option.ukeire} 枚`,
+        shantenAfterDiscard: option.shantenAfterDiscard,
+        ukeire: option.ukeire,
+        waitCount: option.waitCount,
+        averageScore: option.averageScore,
+        offensiveEv: option.offensiveEv,
+        waits: option.waits.slice(0, 6).map(formatTileName),
+        furitenWaits: option.furitenWaits.slice(0, 6).map(formatTileName),
+        branches: option.branches.slice(0, 4).map((branch) => `摸 ${formatTileName(branch.draw)} 后${branch.bestDiscard ? `切 ${formatTileName(branch.bestDiscard)}，` : ""}听牌等待 ${branch.tenpaiWaitCount} 枚，平均打点 ${branch.averageScore}`),
+        notes: option.notes.slice(0, 3),
+      })),
+      message: offensiveEv.message,
+    },
+    routeFactors: {
+      topDiscards: packagedRouteFactors,
+      message: "牌型路线只识别断幺、役牌、混一色、七对子四类稳定路线；不猜三色、一气、平和等细路线。",
+    },
+    safety: {
+      riichiSeats: ([0, 1, 2, 3] as PlaybackSeat[]).filter((seat) => snapshot.riichiTiles[seat].length > 0 && seat !== snapshot.targetSeat),
+      candidateHints: candidateHints.map((hint) => ({
+        tile: hint.tile,
+        tone: hint.tone,
+        labels: [...hint.labels],
+        description: hint.description,
+      })),
+    },
+  };
 }
 
-function formatLlmFallbackIntro(llm: AnalysisLlmResult) {
-  const modelText = llm.model ? `（模型：${llm.model}）` : "";
-  const warningText = llm.warnings.length ? `原因：${llm.warnings.join("；")}` : "未收到可展示的 LLM 回答。";
+function selectEfficiencyOptions<T extends { discard: string }>(options: T[], importantTiles: string[], maxItems: number) {
+  const selected: T[] = [];
+  const add = (option: T | undefined) => {
+    if (option && !selected.some((item) => item.discard === option.discard)) {
+      selected.push(option);
+    }
+  };
 
-  return `暂时没有拿到模型回答${modelText}，我先用当前可见牌面给出一个基础复盘。\n${warningText}`;
+  options.slice(0, 4).forEach(add);
+  importantTiles.forEach((tile) => add(options.find((option) => option.discard === tile)));
+
+  return selected.slice(0, maxItems);
+}
+
+function buildHybridFallbackStructured(
+  question: string,
+  snapshot: VisibleAnalysisSnapshot,
+  llm: AnalysisLlmResult,
+  analysisPackage: CurrentHandAnalysisPackage | undefined,
+): AnalysisChatStructured {
+  const topEngine = analysisPackage?.engine.topRecommendations[0];
+  const topEfficiency = analysisPackage?.tileEfficiency.topDiscards[0];
+  const safetyHints = analysisPackage?.safety.candidateHints ?? [];
+  const target = snapshot.players.find((player) => player.seat === snapshot.targetSeat);
+  const decisionContext = analysisPackage?.decisionContext;
+  const decisionContextLine = decisionContext?.applies ? formatDecisionContextSummary(decisionContext) : "";
+  const reasons = [
+    "\u5f53\u524d\u53ef\u89c1\u4fe1\u606f\u9650\u5236\uff1a\u53ea\u57fa\u4e8e\u5f53\u524d\u5149\u6807\u4e4b\u524d\u7684\u53ef\u89c1\u4fe1\u606f\uff0c\u4e0d\u8bfb\u53d6\u672a\u6765\u4e8b\u4ef6\u6216\u724c\u5c71\u3002",
+    ...(decisionContextLine ? [decisionContextLine] : []),
+    topEngine ? "\u5f53\u524d\u63a8\u8350\u7b2c\u4e00\u5019\u9009\u662f" + topEngine.label + "\uff0c\u53ef\u4ee5\u5148\u628a\u5b83\u5f53\u4f5c\u4e3b\u53c2\u8003\u3002" : "\u5f53\u524d\u6ca1\u6709\u53ef\u7528\u7684\u63a8\u8350\u5019\u9009\uff0c\u5148\u7528\u53ef\u89c1\u724c\u9762\u548c\u724c\u6548\u505a\u57fa\u7840\u5224\u65ad\u3002",
+    topEfficiency ? "\u724c\u6548\u4fa7\u7b2c\u4e00\u5019\u9009\uff1a" + topEfficiency.label : "\u5f53\u524d\u624b\u724c\u5f20\u6570\u6682\u4e0d\u9002\u5408\u505a\u5b8c\u6574\u5411\u542c\u002f\u53d7\u5165\u6392\u5e8f\u3002",
+  ];
+  const risks = [
+    ...(safetyHints.length ? safetyHints.slice(0, 2).map((hint) => `${formatTileName(hint.tile)}：${hint.labels.join("；")}`) : ["没有明显立直现物压力时，也要留意宝牌周边和副露家手役速度。"]),
+    ...(decisionContext?.applies ? decisionContext.notes.slice(0, 1) : []),
+    ...llm.warnings.slice(0, 1),
+  ].filter(Boolean);
+  const evidence = [
+    `${snapshot.round.title}，光标 ${snapshot.cursor}/${snapshot.maxCursor}`,
+    `目标 ${target?.name ?? `seat ${snapshot.targetSeat}`}，手牌 ${formatTileNames(snapshot.targetHand) || "暂无"}`,
+    `宝牌指示牌 ${formatTileNames(snapshot.doraIndicators) || "暂无"}`,
+    ...(decisionContext?.applies ? [decisionContextLine] : []),
+  ];
+
+  return {
+    conclusion: topEngine ? `先按 ${topEngine.label} 作为主线理解，再结合牌效和安全线索取舍。` : buildHeuristicAnswer(question, snapshot).split("\n\n")[0],
+    reasons: reasons.slice(0, 4),
+    risks: risks.slice(0, 3),
+    suggestedQuestions: ["这一步应该押还是降？", "候选切牌怎么排序？", "这张牌对立直家安全吗？"],
+    evidence,
+  };
+}
+
+function formatStructuredChatAnswer(structured: AnalysisChatStructured) {
+  const sections = [structured.conclusion.trim()];
+  const reasons = structured.reasons.slice(0, 3);
+
+  if (reasons.length) {
+    sections.push(`理由：${reasons.join("；")}`);
+  }
+
+  return sections.join("\n\n");
 }
 
 function formatRecommendationForUser(recommendation: AnalysisEngineResult["recommendations"][number]) {
@@ -174,6 +407,18 @@ function formatRecommendationForUser(recommendation: AnalysisEngineResult["recom
   const score = typeof recommendation.probability === "number" ? `（${Math.round(recommendation.probability * 100)}%）` : "";
 
   return `${actionText[recommendation.action] ?? recommendation.action}${recommendation.tile ? ` ${formatTileName(recommendation.tile)}` : ""}${score}`;
+}
+
+function formatShanten(value: number) {
+  if (value < 0) {
+    return value === -1 ? "听牌" : "已和牌";
+  }
+
+  return `${value} 向听`;
+}
+
+function roundWindFromIndex(index: number): "E" | "S" | "W" | "N" {
+  return (["E", "S", "W", "N"] as const)[index] ?? "E";
 }
 
 function buildHeuristicAnswer(question: string, snapshot: VisibleAnalysisSnapshot) {

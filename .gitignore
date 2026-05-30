@@ -32,10 +32,35 @@ yarn-error.log*
 dev-server*.log
 mortal-sidecar*.log
 .cache-*.js
+scripts/tmp-*.ts
 
 # env files (can opt-in for committing if needed)
 .env*
 !.env.example
+
+# local/private service code
+/src/server/
+/src/app/api/admin/
+/src/app/api/auth/
+/src/app/api/recharge/
+/src/app/api/payments/
+/src/app/api/wallet/
+/src/app/api/analysis-jobs/
+/backend-private/
+/private-backend/
+/commercial-backend/
+/drizzle.config.ts
+
+# local engine/model artifacts
+/models/
+/engines/
+/MahjongCopilot/
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.ckpt
+*.bin
 
 # vercel
 .vercel

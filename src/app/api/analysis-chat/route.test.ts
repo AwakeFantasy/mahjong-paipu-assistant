@@ -87,6 +87,9 @@ describe("POST /api/analysis-chat", () => {
         return new Response(JSON.stringify({ recommendations: [{ action: "discard", tile: "1m", rank: 1, score: 0.8, tags: ["mock"] }] }), { status: 200 });
       }
 
+      expect(serializedBody).toContain("analysisPackage");
+      expect(serializedBody).toContain("topRecommendations");
+
       return new Response(
         JSON.stringify({
           choices: [
@@ -94,9 +97,11 @@ describe("POST /api/analysis-chat", () => {
               message: {
                 content: JSON.stringify({
                   answer: "保留复合形，先处理孤张。",
-                  keyPoints: ["保留复合形", "处理孤张"],
-                  caveats: ["不读取未来事件"],
+                  conclusion: "保留复合形，先处理孤张。",
+                  reasons: ["保留复合形", "处理孤张"],
+                  risks: ["不读取未来事件"],
                   suggestedQuestions: ["这巡该押吗"],
+                  evidence: ["Mortal 第一候选"],
                   warnings: [],
                 }),
               },
@@ -123,8 +128,9 @@ describe("POST /api/analysis-chat", () => {
     expect(payload.engine.recommendations[0].tile).toBe("1m");
     expect(payload.llm).toMatchObject({ provider: "openai-compatible", model: "mock-model", status: "available" });
     expect(payload.answer).toContain("保留复合形");
-    expect(payload.answer).toContain("要点");
-    expect(payload.answer).toContain("注意");
+    expect(payload.answer).toContain("理由");
+    expect(payload.answer).not.toContain("Mortal");
+    expect(payload.structured.reasons).toContain("保留复合形");
   });
 
   it("passes requested flash/pro model choices to the LLM provider", async () => {

@@ -1,12 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Bot, ChevronRight, Clipboard, Clock, Info, Loader2, MessageSquareText, Send, ShieldAlert, Sparkles, Star, Trash2, Trophy, UsersRound } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import { Tile } from "@/components/paipu/tiles";
 import type { TileEfficiencyAnalysis } from "@/lib/majsoul/tile-efficiency";
+import type { OffensiveEvAnalysis } from "@/lib/majsoul/offensive-ev";
 import { formatTileName } from "../../lib/majsoul/tile-format";
 import type { AnalysisChatMessage, AnalysisEngineRecommendation, AnalysisLlmModelChoice, AnalyzeDebug, DecisionDifference, EngineOverlay, Player, Round } from "@/lib/majsoul/types";
 
@@ -39,6 +40,10 @@ export type MortalPreanalysisStats = {
 
 type TileEfficiencyPanelProps = {
   analysis: TileEfficiencyAnalysis;
+};
+
+type OffensiveEvPanelProps = {
+  analysis: OffensiveEvAnalysis;
 };
 
 type PaipuLibraryEntry = {
@@ -123,7 +128,7 @@ export function RoundListPanel({ rounds, players = [], selectedRoundId, onSelect
           })
         ) : (
           <p className="rounded-lg border border-dashed border-zinc-200 bg-zinc-50 p-4 text-sm leading-6 text-zinc-500">
-            粘贴雀魂牌谱 URL 后，局列表会显示在这里。
+            粘贴雀魂/天凤/一番街牌谱后，局列表会显示在这里。
           </p>
         )}
       </div>
@@ -523,6 +528,83 @@ export function TileEfficiencyPanel({ analysis }: TileEfficiencyPanelProps) {
   );
 }
 
+export function OffensiveEvPanel({ analysis }: OffensiveEvPanelProps) {
+  const bestOptions = analysis.options.filter((option) => option.shantenAfterDiscard <= 1).slice(0, 3);
+  const routeOptions = analysis.options.filter((option) => option.shantenAfterDiscard > 1).slice(0, 3);
+  const bestOption = bestOptions[0];
+  const helpText = bestOption
+    ? `实验性进攻EV 只比较听牌和一向听候选。切 ${formatTileName(bestOption.discard)} 后 EV ${bestOption.offensiveEv}，预计打点 ${bestOption.averageScore}，进张 ${bestOption.ukeire} 枚。`
+    : "二向听以上只显示路线参考，不按 EV 决策。";
+
+  return (
+    <PanelShell
+      title="实验性进攻EV"
+      eyebrow={analysis.status === "ready" ? "实验" : "待计算"}
+      icon={Trophy}
+      action={analysis.status === "ready" ? <InfoTooltip text={helpText} /> : null}
+      className="overflow-hidden"
+    >
+      {analysis.status === "ready" ? (
+        <div className="min-w-0 space-y-2">
+          {bestOptions.length ? (
+            <div className="min-w-0 overflow-hidden rounded-md border border-zinc-200">
+              <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-2 py-1.5">
+                <span className="text-xs font-bold text-zinc-800">EV 候选</span>
+                <span className="text-[11px] text-zinc-500">仅听牌 / 一向听</span>
+              </div>
+              {bestOptions.map((option, index) => (
+                <div key={option.discard} className={`grid min-w-0 grid-cols-[auto_1fr_auto] items-center gap-2 border-t border-zinc-100 px-2 py-2 first:border-t-0 ${index === 0 ? "bg-emerald-50/70" : ""}`}>
+                  <span className="font-mono text-[11px] font-extrabold text-zinc-400">{String(index + 1).padStart(2, "0")}</span>
+                  <div className="min-w-0">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span className="shrink-0 text-xs font-bold text-zinc-500">切</span>
+                      <Tile value={option.discard} size="compact" flat />
+                      <span className="truncate text-xs font-bold text-zinc-900">EV {option.offensiveEv}</span>
+                    </div>
+                    <p className="mt-1 truncate text-[11px] text-zinc-500">
+                      预计打点 {option.averageScore} · 进张 {option.ukeire}
+                      {option.furitenWaits.length ? ` 路 振听 ${option.furitenWaits.join("、")}` : ""}
+                    </p>
+                    <p className="mt-0.5 truncate text-[11px] text-zinc-400">未来听牌规模 {option.waitCount} · 向听 {option.shantenAfterDiscard}</p>
+                  </div>
+                  <div className="text-right">
+                    <strong className="block font-mono text-xs text-zinc-950">{option.offensiveEv}</strong>
+                    <span className="text-[10px] text-zinc-500">EV</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="rounded-lg border border-dashed border-zinc-200 bg-zinc-50 p-3 text-sm leading-6 text-zinc-500">当前还没有听牌或一向听候选，暂不做 EV 排序。</p>
+          )}
+          {routeOptions.length ? (
+            <div className="min-w-0 rounded-md border border-zinc-200 bg-zinc-50 p-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-zinc-800">远手路线参考</span>
+                <span className="text-[11px] text-zinc-500">不参与 EV 排序</span>
+              </div>
+              <div className="mt-2 space-y-1.5">
+                {routeOptions.map((option) => (
+                  <div key={`route-${option.discard}`} className="flex min-w-0 items-center justify-between gap-2 rounded border border-zinc-200 bg-white px-2 py-1.5">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span className="shrink-0 text-xs font-bold text-zinc-500">切</span>
+                      <Tile value={option.discard} size="compact" flat />
+                      <span className="truncate text-xs text-zinc-600">{option.shantenAfterDiscard}向听 · 未来听牌规模 {option.ukeire}</span>
+                    </div>
+                    <span className="shrink-0 font-mono text-xs text-zinc-500">参考 {option.offensiveEv}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        <p className="rounded-lg border border-dashed border-zinc-200 bg-zinc-50 p-3 text-sm leading-6 text-zinc-500">{analysis.message ?? "实验性进攻EV 暂不可用。"}</p>
+      )}
+    </PanelShell>
+  );
+}
+
 export function AnalysisChatPanel({ messages, disabled, pending, model, snapshotLabel, error, onModelChange, onAsk }: AnalysisChatPanelProps) {
   return (
     <PanelShell title="AI 复盘聊天" eyebrow={snapshotLabel} icon={MessageSquareText} className="overflow-hidden">
@@ -548,17 +630,22 @@ export function AnalysisChatPanel({ messages, disabled, pending, model, snapshot
 
         <div className="min-h-64 max-h-[420px] min-w-0 space-y-3 overflow-y-auto rounded-lg border border-zinc-200 bg-zinc-50 p-3">
           {messages.length ? (
-            messages.map((message) => (
+            <>
+              {messages.map((message) => (
               <div key={message.id} className={`flex min-w-0 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
                 <div
                   className={`max-w-[92%] whitespace-pre-line break-words rounded-lg px-3 py-2 text-sm leading-6 ${
                     message.role === "user" ? "bg-zinc-950 text-white" : "border border-zinc-200 bg-white text-zinc-700"
                   }`}
                 >
-                  {message.content}
+                  {message.role === "assistant" && message.structured ? <StructuredAnalysisMessage structured={message.structured} pending={pending} onAsk={onAsk} /> : message.content}
                 </div>
               </div>
-            ))
+              ))}
+              {pending ? <PendingAnalysisMessage /> : null}
+            </>
+          ) : pending ? (
+            <PendingAnalysisMessage />
           ) : (
             <div className="grid min-h-56 place-items-center text-center">
               <div>
@@ -610,6 +697,97 @@ export function AnalysisChatPanel({ messages, disabled, pending, model, snapshot
         </form>
       </div>
     </PanelShell>
+  );
+}
+
+function StructuredAnalysisMessage({
+  structured,
+  pending,
+  onAsk,
+}: {
+  structured: NonNullable<AnalysisChatMessage["structured"]>;
+  pending: boolean;
+  onAsk: (question: string) => void | Promise<void>;
+}) {
+  const chips = [...new Set([...(structured.suggestedQuestions ?? []), ...(structured.directReplies ?? [])])].filter((item) => item.trim().length > 0);
+  const hasMore = Boolean(structured.risks.length || structured.evidence.length);
+
+  return (
+    <div className="space-y-3 whitespace-normal">
+      <AnalysisMessageList title="纠正" items={structured.correctionsAccepted ?? []} />
+      <p className="text-sm font-semibold leading-6 text-zinc-900">{structured.conclusion}</p>
+      <AnalysisMessageList title="理由" items={structured.reasons} />
+      {hasMore ? (
+        <details className="rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1.5">
+          <summary className="cursor-pointer list-none text-[11px] font-semibold text-zinc-500">更多</summary>
+          <div className="mt-2 space-y-3">
+            <AnalysisMessageList title="风险" items={structured.risks} />
+            <AnalysisMessageList title="依据" items={structured.evidence} />
+          </div>
+        </details>
+      ) : null}
+      {chips.length ? (
+        <div className="mt-3 flex flex-wrap gap-1.5 border-t border-zinc-100 pt-3">
+          <p className="basis-full text-[11px] font-semibold text-zinc-500">可追问</p>
+          {chips.map((reply) => (
+            <button
+              key={reply}
+              type="button"
+              disabled={pending}
+              onClick={() => void onAsk(reply)}
+              className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-800 transition hover:border-emerald-300 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {reply}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PendingAnalysisMessage() {
+  const [dots, setDots] = useState("。");
+
+  useEffect(() => {
+    const states = ["。", "。。", "。。。"];
+    let index = 0;
+
+    const timer = window.setInterval(() => {
+      index = (index + 1) % states.length;
+      setDots(states[index]);
+    }, 550);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="flex min-w-0 justify-start">
+      <div className="max-w-[92%] rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm leading-6 text-zinc-700">
+        <p className="font-medium text-zinc-900" aria-live="polite">
+          AI 思考中{dots}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function AnalysisMessageList({ title, items }: { title: string; items: string[] }) {
+  if (!items.length) {
+    return null;
+  }
+
+  return (
+    <div className="space-y-1">
+      <p className="text-[11px] font-semibold text-zinc-500">{title}</p>
+      <ul className="space-y-1">
+        {items.map((item, index) => (
+          <li key={`${title}-${index}`} className="break-words text-sm leading-6 text-zinc-700">
+            {item}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 

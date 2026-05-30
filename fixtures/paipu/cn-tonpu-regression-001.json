@@ -22,8 +22,8 @@
       "visibleTiles": ["5z"],
       "waitTile": "5z",
       "theoretical": 3,
-      "visible": 1,
-      "remaining": 2
+      "visible": 2,
+      "remaining": 1
     }
   },
   "game": {

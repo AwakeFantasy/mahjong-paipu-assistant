@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { answerAnalysisChat } from "../../../lib/majsoul/analysis-chat";
+import { scoreWinningHand } from "../../../lib/majsoul/mahjong-score";
 import type { AnalysisChatRequest } from "../../../lib/majsoul/types";
 
 export const runtime = "nodejs";
@@ -25,7 +26,7 @@ export async function POST(request: NextRequest) {
       mode: body.mode ?? "current-hand",
       llmModel: body.llmModel === "flash" || body.llmModel === "pro" ? body.llmModel : undefined,
       visibleEvents: Array.isArray(body.visibleEvents) ? body.visibleEvents : undefined,
-    });
+    }, { scoreWinningHand });
 
     return NextResponse.json(response);
   } catch {

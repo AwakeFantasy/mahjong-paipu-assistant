@@ -42,7 +42,7 @@ const supportedTileCounts = new Set([1, 2, 4, 5, 7, 8, 10, 11, 13, 14]);
 
 export function analyzeTileEfficiency(tiles: string[], visibleTiles: string[] = []): TileEfficiencyAnalysis {
   const normalizedTiles = tiles.map(normalizeRedFive).filter(isSupportedTile);
-  const visibleCounts = countTiles(visibleTiles);
+  const visibleCounts = countTiles([...visibleTiles, ...normalizedTiles]);
   const tileCount = normalizedTiles.length;
 
   if (!tileCount) {
@@ -83,7 +83,7 @@ function buildDiscardOptions(tiles: string[], hairi: HairiResult, visibleCounts:
 
   return uniqueDiscards
     .map((discard) => {
-      const waits = normalizeWaits(toWaitRecord(hairi[discard]), visibleCounts, discard);
+      const waits = normalizeWaits(toWaitRecord(hairi[discard]), visibleCounts);
       const afterDiscard = removeOneTile(tiles, discard);
 
       return {
@@ -99,10 +99,10 @@ function buildDiscardOptions(tiles: string[], hairi: HairiResult, visibleCounts:
     .sort((left, right) => left.shantenAfterDiscard - right.shantenAfterDiscard || right.waitCount - left.waitCount || tileSortKey(left.discard) - tileSortKey(right.discard));
 }
 
-function normalizeWaits(waitRecord: Record<string, number> | undefined, visibleCounts: Map<string, number>, extraVisibleTile?: string): TileEfficiencyWait[] {
+function normalizeWaits(waitRecord: Record<string, number> | undefined, visibleCounts: Map<string, number>): TileEfficiencyWait[] {
   return Object.entries(waitRecord ?? {})
     .map(([tile, theoretical]) => {
-      const visible = Math.min(theoretical, (visibleCounts.get(tile) ?? 0) + (extraVisibleTile === tile ? 1 : 0));
+      const visible = Math.min(theoretical, visibleCounts.get(tile) ?? 0);
 
       return {
         tile,

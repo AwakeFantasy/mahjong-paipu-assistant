@@ -4,13 +4,14 @@ import { CircleDot, Eye, EyeOff, Import, Loader2, ShieldAlert, Sparkles } from "
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { PaipuTable } from "@/components/paipu/paipu-table";
-import { AnalysisChatPanel, DebugPanel, EngineComparePanel, PaipuLibraryPanel, PlayersPanel, RoundListPanel, TileEfficiencyPanel } from "@/components/paipu/panels";
+import { AnalysisChatPanel, DebugPanel, EngineComparePanel, OffensiveEvPanel, PaipuLibraryPanel, PlayersPanel, RoundListPanel, TileEfficiencyPanel } from "@/components/paipu/panels";
 import type { MortalPreanalysisStats } from "@/components/paipu/panels";
 import { EventTimeline, type EventTimelineMarker, PlaybackControls } from "@/components/paipu/playback-controls";
 import { TenhouLayoutPreview } from "@/components/paipu/tenhou-layout-preview";
 import { eventSeatLabel, formatRoundEvent } from "@/components/paipu/event-format";
 import { buildVisibleAnalysisSnapshot, makeSnapshotKey } from "@/lib/majsoul/analysis-chat";
 import { buildDecisionPoints, compareDecisionDifference, makeIdleEngineOverlay } from "@/lib/majsoul/decision-points";
+import { analyzeOffensiveEv, type OffensiveEvAnalysis } from "@/lib/majsoul/offensive-ev";
 import { buildPlaybackState } from "@/lib/majsoul/playback";
 import { analyzeTileEfficiency } from "@/lib/majsoul/tile-efficiency";
 import { formatTileName } from "@/lib/majsoul/tile-format";
@@ -225,6 +226,11 @@ function isPersistableEngineOverlay(value: unknown): value is EngineOverlay {
   );
 }
 
+function roundWindFromIndex(index: number): "E" | "S" | "W" | "N" {
+  const winds = ["E", "S", "W", "N"] as const;
+  return winds[index] ?? "E";
+}
+
 function saveStoredEngineOverlay(overlay: EngineOverlay) {
   if (!isPersistableEngineOverlay(overlay)) {
     return;
@@ -289,8 +295,11 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
   const [revealOpponentHands, setRevealOpponentHands] = useState(false);
   const [savedPaipus, setSavedPaipus] = useState<SavedPaipuEntry[]>([]);
   const [savedPaipusLoaded, setSavedPaipusLoaded] = useState(false);
+  const [offensiveEvAnalysis, setOffensiveEvAnalysis] = useState<OffensiveEvAnalysis | null>(null);
+  const [offensiveEvAnalysisKey, setOffensiveEvAnalysisKey] = useState<string | null>(null);
   const engineOverlaysRef = useRef(engineOverlays);
   const engineOverlayRequestsRef = useRef<Record<string, Promise<EngineOverlay>>>({});
+  const offensiveEvRequestRef = useRef(0);
 
   const rounds = useMemo(() => game?.rounds ?? [], [game?.rounds]);
   const players = useMemo(() => game?.players ?? placeholderPlayers, [game?.players]);
@@ -317,6 +326,10 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
   const tileEfficiency = useMemo(
     () => analyzeTileEfficiency(playback?.targetHand ?? selectedRound?.initialHands[activePlayer.seat] ?? [], visibleEfficiencyTiles),
     [activePlayer.seat, playback?.targetHand, selectedRound?.initialHands, visibleEfficiencyTiles],
+  );
+  const offensiveEvTiles = useMemo(
+    () => playback?.targetHand ?? selectedRound?.initialHands[activePlayer.seat] ?? [],
+    [activePlayer.seat, playback?.targetHand, selectedRound?.initialHands],
   );
   const currentEventText = playback?.currentEvent
     ? formatRoundEvent(playback.currentEvent, players)
@@ -399,6 +412,10 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
     },
     [currentDecisionPoint, engineOverlays],
   );
+  const displayedOffensiveEvAnalysis =
+    offensiveEvAnalysis && offensiveEvAnalysisKey === analysisSnapshotKey
+      ? offensiveEvAnalysis
+      : { status: "empty" as const, options: [], message: "先推进到一个具体牌局状态，再看实验性进攻EV。" };
   const differenceLabel = differenceNotice ?? formatDifferenceLabel(currentDecisionDifference, decisionPoints.length);
   const mortalPreanalysisStats = useMemo<MortalPreanalysisStats>(() => {
     const overlays = allDecisionPoints.map((point) => engineOverlays[point.snapshotKey]);
@@ -409,6 +426,34 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
       unavailable: overlays.filter((overlay) => overlay?.status === "unavailable").length,
     };
   }, [allDecisionPoints, engineOverlays]);
+
+  useEffect(() => {
+    if (!selectedRound || !playback || !offensiveEvTiles.length) {
+      return;
+    }
+
+    const requestId = offensiveEvRequestRef.current + 1;
+    offensiveEvRequestRef.current = requestId;
+
+    void analyzeOffensiveEv({
+      tiles: offensiveEvTiles,
+      visibleTiles: visibleEfficiencyTiles,
+      doraIndicators: playback.doraIndicators,
+      openMeldCount: playback.calls[activePlayer.seat].length,
+      ownDiscards: playback.discards[activePlayer.seat],
+      ownCalls: playback.calls[activePlayer.seat].map((call) => ({
+        callType: call.callType,
+        tiles: call.tiles,
+      })),
+      seatWind: activePlayer.wind,
+      roundWind: roundWindFromIndex(selectedRound.windRound),
+    }).then((analysis) => {
+      if (offensiveEvRequestRef.current === requestId) {
+        setOffensiveEvAnalysis(analysis);
+        setOffensiveEvAnalysisKey(analysisSnapshotKey);
+      }
+    });
+  }, [activePlayer.seat, activePlayer.wind, analysisSnapshotKey, offensiveEvTiles, playback, selectedRound, visibleEfficiencyTiles]);
 
   useEffect(() => {
     if (!playbackPlaying || !selectedRound) {
@@ -919,6 +964,7 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
           role: "assistant",
           content: payload.answer,
           snapshotKey: payload.snapshotKey,
+          structured: payload.structured,
         },
       ]);
     } catch {
@@ -958,14 +1004,14 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
             </div>
             <div className="min-w-0">
               <h1 className="truncate text-xl font-semibold">日麻牌谱解析助手</h1>
-              <p className="truncate text-sm text-zinc-500">导入雀魂牌谱，边看牌桌边复盘。</p>
+              <p className="truncate text-sm text-zinc-500">导入雀魂/天凤/一番街牌谱，边看牌桌边复盘。</p>
             </div>
           </div>
 
           <form onSubmit={analyzePaipu} className="flex w-full min-w-0 flex-col gap-3 lg:max-w-4xl">
             <div className="flex min-w-0 flex-col gap-3 lg:flex-row">
               <label className="sr-only" htmlFor="paipu-url">
-                雀魂牌谱链接
+                雀魂/天凤/一番街牌谱链接
               </label>
               <div className="flex min-h-12 min-w-0 flex-1 items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3">
                 <Import className="h-4 w-4 shrink-0 text-zinc-500" aria-hidden="true" />
@@ -975,7 +1021,7 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
                   name="url"
                   onChange={(event) => setPaipuUrl(event.target.value)}
                   className="min-w-0 w-full bg-transparent text-sm outline-none"
-                  placeholder="粘贴雀魂牌谱链接，例如 https://game.maj-soul.com/1/?paipu=..."
+                  placeholder="粘贴雀魂、天凤或一番街牌谱，例如 https://game.maj-soul.com/1/?paipu=...、https://tenhou.net/0/?log=... 或 ch35u1e9nc70954ah9n0"
                 />
               </div>
               <button
@@ -1072,6 +1118,7 @@ function AnalyzerHomeClient({ initialDebugMode }: { initialDebugMode: boolean })
           <aside className="order-3 grid min-w-0 gap-2 md:grid-cols-2 lg:order-3 lg:block lg:space-y-2">
             <EngineComparePanel difference={currentDecisionDifference} overlay={currentEngineOverlay} preanalysisStats={mortalPreanalysisStats} />
             <TileEfficiencyPanel analysis={tileEfficiency} />
+            <OffensiveEvPanel analysis={displayedOffensiveEvAnalysis} />
             <AnalysisChatPanel
               messages={visibleChatMessages}
               disabled={!analysisSnapshot}

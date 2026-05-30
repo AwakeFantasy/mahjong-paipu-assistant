@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import type { PlaybackState } from "./playback";
-import { buildTileSafetyHint } from "./safety-hints";
+import { buildTileSafetyHint, buildTileSafetyHintFromSnapshot } from "./safety-hints";
+import type { VisibleAnalysisSnapshot } from "./types";
 
 describe("buildTileSafetyHint", () => {
   it("marks tiles discarded by an opponent riichi player as genbutsu", () => {
@@ -46,6 +47,54 @@ describe("buildTileSafetyHint", () => {
 
     expect(hint?.labels).toContain("四枚可见");
   });
+
+  it("treats tiles passed after riichi as safe against that riichi player", () => {
+    const snapshot = makeSnapshot({
+      discards: {
+        0: ["1m"],
+        1: ["9p", "4s"],
+        2: ["6s"],
+        3: [],
+      },
+      riichiTiles: { 0: [], 1: [1], 2: [], 3: [] },
+    });
+    const hint = buildTileSafetyHintFromSnapshot({
+      tile: "6s",
+      snapshot,
+      visibleEvents: [
+        { type: "discard", seat: 1, tile: "4s", moqie: false, riichi: true },
+        { type: "discard", seat: 2, tile: "6s", moqie: false, riichi: false },
+      ],
+    });
+
+    expect(hint?.tone).toBe("safe");
+    expect(hint?.labels.join(" ")).toContain("对所有立直家现物/通过牌");
+  });
+
+  it("keeps a tile cautious when it passed one riichi player but not another", () => {
+    const snapshot = makeSnapshot({
+      discards: {
+        0: ["1m"],
+        1: ["9p", "4s"],
+        2: ["6s"],
+        3: ["7p"],
+      },
+      riichiTiles: { 0: [], 1: [1], 2: [], 3: [0] },
+    });
+    const hint = buildTileSafetyHintFromSnapshot({
+      tile: "6s",
+      snapshot,
+      visibleEvents: [
+        { type: "discard", seat: 1, tile: "4s", moqie: false, riichi: true },
+        { type: "discard", seat: 2, tile: "6s", moqie: false, riichi: false },
+        { type: "discard", seat: 3, tile: "7p", moqie: false, riichi: true },
+      ],
+    });
+
+    expect(hint?.tone).toBe("caution");
+    expect(hint?.labels.join(" ")).toContain("对立直家通过牌");
+    expect(hint?.labels.join(" ")).toContain("对立直家非现物");
+  });
 });
 
 function makePlayback(overrides: Partial<PlaybackState>): PlaybackState {
@@ -60,6 +109,24 @@ function makePlayback(overrides: Partial<PlaybackState>): PlaybackState {
     doraIndicators: [],
     scores: { 0: 25000, 1: 25000, 2: 25000, 3: 25000 },
     riichiTiles: { 0: [], 1: [], 2: [], 3: [] },
+    ...overrides,
+  };
+}
+
+function makeSnapshot(overrides: Partial<VisibleAnalysisSnapshot>): VisibleAnalysisSnapshot {
+  return {
+    source: { id: "sample", region: "cn" },
+    round: { id: "east-1", title: "东1局", windRound: 0, roundNumber: 0, honba: 0, riichiSticks: 0, dealer: "东家", danger: "mid" },
+    cursor: 0,
+    maxCursor: 0,
+    targetSeat: 0,
+    players: [{ seat: 0, wind: "E", name: "A", score: "25,000", startScore: 25000, style: "目标" }],
+    doraIndicators: [],
+    targetHand: [],
+    discards: { 0: [], 1: [], 2: [], 3: [] },
+    calls: { 0: [], 1: [], 2: [], 3: [] },
+    riichiTiles: { 0: [], 1: [], 2: [], 3: [] },
+    currentEventText: "",
     ...overrides,
   };
 }

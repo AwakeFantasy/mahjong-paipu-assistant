@@ -73,6 +73,7 @@ export function createDebugCollector(): DebugCollector {
       value.source = {
         id: source.id,
         region: source.region,
+        provider: source.provider,
         targetSeat: source.targetSeat,
       };
     },
